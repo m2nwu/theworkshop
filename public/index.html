@@ -958,6 +958,9 @@ html.fs body.mnav #play-board{height:100vh!important;height:100dvh!important;min
 }
 @media(max-width:360px){.acct-btn:not(.on) .acct-ic{display:none}.acct-btn:not(.on){padding:4px 10px}}
 @media(max-width:760px){.acct-pop{max-height:calc(100dvh - var(--tb,52px) - 16px);overflow-y:auto;overscroll-behavior:contain}}
+/* 친선 배틀: 랭킹표 없이 한 칸 */
+.rank-panel.friendly .rk-board,.rank-panel.friendly .rk-me,.rank-panel.friendly .rk-rule:empty{display:none}
+.rank-panel.friendly .rk-cols{grid-template-columns:1fr;max-width:640px;margin-inline:auto}
 
 </style>
 
@@ -997,13 +1000,19 @@ html.fs body.mnav #play-board{height:100vh!important;height:100dvh!important;min
       <div id="lobby-gold" class="lobby-gold"></div>
       <button id="play-game" class="start-button" type="button" data-i18n="lobby.start">게임 시작</button>
       <div class="lobby-btns">
+      <button id="rank-open" class="rank-open" type="button">랭크 대전</button>
       <button id="tut-open" class="tut-open" type="button">게임 방법</button>
       </div>
       <div class="lobby-note" data-i18n="lobby.note">번호와 순서는 매 판 무작위 · 원석 60장 · 체력 1</div>
     </div>
   </section>
 
-
+  <section id="rank-panel" class="rank-panel" hidden aria-labelledby="rk-h">
+    <div class="rk-box">
+      <div class="rk-head"><div><h2 id="rk-h" data-rkt="title">랭크 대전</h2><p data-rkt="lede"></p></div><button type="button" class="ghost" data-rk="back">로비로</button></div>
+      <div class="rk-cols"><div class="rk-left"><div class="rk-top"><span class="rk-online"></span><div class="rk-me"></div></div><div class="rk-body"></div><p class="rk-rule" data-rkt="rule"></p><p class="rk-share" data-rkt="share"></p></div><div class="rk-board"></div></div>
+    </div>
+  </section>
 
   <section id="game-screen" hidden>
     <div class="hud-top">
@@ -1429,7 +1438,9 @@ globalThis.WorkshopI18n = (() => {
     names();
     listeners.forEach(f => { try { f(lang); } catch (e) { console.error(e); } });
   }
-  return { t, seat, setSeatNamer: f => { namer = f; }, set, LANGS, get lang() { return lang; }, onChange: f => listeners.push(f), names, label: l => D[l]['lang.name'] };
+  // 다른 언어로 잠깐 바꿔 계산 (온라인 대전에서 방장이 모든 언어로 기록을 보낼 때)
+  function withLang(l, fn) { if (!LANGS.includes(l) || l === lang) return fn(); const prev = lang; lang = l; names(); try { return fn(); } finally { lang = prev; names(); } }
+  return { t, seat, withLang, setSeatNamer: f => { namer = f; }, set, LANGS, get lang() { return lang; }, onChange: f => listeners.push(f), names, label: l => D[l]['lang.name'] };
 })();
 
 WorkshopI18n.names();WorkshopCards.rebuild();
@@ -2063,6 +2074,8 @@ function build3D() {
       document.getElementById('end-title').parentElement.style.setProperty('--c', win ? '#e2c07c' : lost ? '#e0453f' : '#c9b8a6');
       document.getElementById('end-kicker').textContent = L.t(win ? 'end.kWin' : lost ? 'end.kLose' : 'end.kDraw');
       document.getElementById('end-text').textContent = win ? L.t('end.tWin', { t: g.turn }) : lost ? L.t('end.tLose', { t: g.turn, n: g.hp.filter(Boolean).length }) : L.t('end.tDraw');
+      if (globalThis.WorkshopEndNote) document.getElementById('end-text').textContent = globalThis.WorkshopEndNote;
+      if (globalThis.WorkshopEndTitle) document.getElementById('end-title').textContent = globalThis.WorkshopEndTitle;
       if (endPanel.hidden) { endPanel.hidden = false; if (win) { flash(new T.Vector3(0, 2, 0), 0xffc27a, 12, 1400); sparks(new T.Vector3(0, 1, 0), 0xffc27a, 120, 7, 1600); } }
     } else endPanel.hidden = true;
   }
@@ -2882,6 +2895,77 @@ ${hint ? `<p class="ccd-hint">${esc(hint)}</p>` : ''}<div class="ccd-actions">${
   return { load, snapshot, paint: paintAll, paintLobby, draw, liveRates, equipped, equip, detail, PRICE, TEN_COUNT, get owned() { return { ...owned }; } };
 })();
 
+/* 친선 배틀 연결 (Cloudflare 버전): 서버의 실시간 방(웹소켓)을 게임의 멀티플레이 코드가 쓰는 방 인터페이스로 이어 줍니다.
+ * 로그인한 사람만 접속할 수 있어요. 점수·랭킹은 없습니다. */
+globalThis.WORKSHOP_FRIENDLY = true;
+(() => {
+  const TOK = 'workshop-cf-token';
+  const tok = () => { try { return localStorage.getItem(TOK); } catch (e) { return null; } };
+  let ws = null, ready = null, myPeer = null, pingT = 0, wantOpen = false;
+  const rooms = new Map(), names = {};
+  const R = room => { if (!rooms.has(room)) rooms.set(room, { pc: [], ec: [], tp: {}, peers: [] }); return rooms.get(room); };
+  const send = o => { if (ws && ws.readyState === 1) { ws.send(JSON.stringify(o)); return true; } return false; };
+
+  function connect() {
+    const t = tok(); if (!t) return Promise.reject(new Error('login'));
+    return new Promise((res, rej) => {
+      let opened = false;
+      const sock = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/ws?token=' + encodeURIComponent(t));
+      ws = sock; wantOpen = true;
+      sock.onmessage = e => {
+        let m; try { m = JSON.parse(e.data); } catch (x) { return; }
+        if (m.t === 'hello') { myPeer = m.peer; opened = true; clearInterval(pingT); pingT = setInterval(() => send({ t: 'ping' }), 25000); res(); return; }
+        if (m.t === 'peers') {
+          const r = R(m.room);
+          const peers = (m.peers || []).map(p => ({ ...p, sameTab: p.peer === myPeer }));
+          peers.forEach(p => { if (p.by) names[p.by] = p.name; });
+          const joined = peers.filter(p => !r.peers.some(q => q.peer === p.peer));
+          r.peers = peers;
+          const ch = { peers, joined, left: m.left || [] };
+          r.pc.slice().forEach(f => { try { f(ch); } catch (x) { console.error(x); } });
+          return;
+        }
+        if (m.t === 'msg') { const r = rooms.get(m.room); if (r) (r.tp[m.topic] || []).slice().forEach(f => { try { f({ peer: m.peer, topic: m.topic, data: m.data }); } catch (x) { console.error(x); } }); }
+      };
+      sock.onclose = () => {
+        if (ws === sock) { ws = null; ready = null; }
+        clearInterval(pingT);
+        const rs = [...rooms.values()]; rooms.clear();
+        rs.forEach(r => r.ec.forEach(f => { try { f(new Error('closed')); } catch (x) {} }));
+        if (!opened) rej(new Error('closed'));
+        // 끊기면 잠시 뒤 다시 연결 (로그인 상태일 때만)
+        else if (wantOpen && tok()) setTimeout(() => dispatchEvent(new Event('workshop-auth')), 2500);
+      };
+    });
+  }
+  function api(room) {
+    return {
+      onPeers(cb, err) { const r = R(room); r.pc.push(cb); if (err) r.ec.push(err); if (r.peers.length) setTimeout(() => cb({ peers: r.peers, joined: r.peers, left: [] }), 0); return () => { r.pc = r.pc.filter(f => f !== cb); }; },
+      presence(data) { send({ t: 'presence', room, data }); return Promise.resolve(); },
+      on(topic, cb) { const r = R(room); (r.tp[topic] || (r.tp[topic] = [])).push(cb); return () => { r.tp[topic] = r.tp[topic].filter(f => f !== cb); }; },
+      emit(topic, data) { return send({ t: 'emit', room, topic, data }) ? Promise.resolve() : Promise.reject(new Error('offline')); },
+      leave() { send({ t: 'leave', room }); rooms.delete(room); return Promise.resolve(); }
+    };
+  }
+  // 게임의 멀티플레이 코드가 찾는 인터페이스
+  globalThis.claude = {
+    async use(cap) {
+      if (cap === 'room') {
+        if (!ready) ready = connect().catch(e => { ready = null; throw e; });
+        await ready;
+        return { ...api(''), async join(name) { R(name); send({ t: 'join', room: name }); return api(name); } };
+      }
+      if (cap === 'user') {
+        const u = globalThis.WorkshopCloud?.user; if (!u || !tok()) throw new Error('login');
+        return { async me() { return { id: u.id, name: u.name }; }, async profiles(ids) { const o = {}; for (const id of ids) o[id] = { name: names[id] || (id === u.id ? u.name : id) }; return o; } };
+      }
+      return null; // db(랭킹)는 친선 배틀에서 쓰지 않아요
+    }
+  };
+  // 로그아웃하면 연결을 끊습니다
+  addEventListener('workshop-auth', () => { if (!tok() && ws) { wantOpen = false; try { ws.close(); } catch (e) {} } });
+})();
+
 /* 계정 저장 (Cloudflare 서버 버전): 아이디·비밀번호로 가입하고 로그인하면
  * 골드·컬렉션·장착 캐릭터 카드·사용한 코드가 서버에 저장됩니다. 코드는 서버에서만 확인합니다. */
 globalThis.WorkshopCloud = (() => {
@@ -2948,6 +3032,7 @@ globalThis.WorkshopCloud = (() => {
   async function enter(r) {
     token = r.token; user = r.user; wr(TOK, token); wr(USER, JSON.stringify(user));
     await sync(true);
+    try { dispatchEvent(new Event('workshop-auth')); } catch (e) {}
   }
   // 서버 기록을 받아 와 이 기기와 맞춥니다
   async function sync(first) {
@@ -2980,6 +3065,7 @@ globalThis.WorkshopCloud = (() => {
     await flush();
     try { await api('logout', 'POST', {}); } catch (e) {}
     forget(); apply(EMPTY); note = ''; paint();
+    try { dispatchEvent(new Event('workshop-auth')); } catch (e) {}
   }
   // 상점 코드 입력: 서버에서 확인합니다
   async function redeem(code) {
@@ -3140,10 +3226,10 @@ globalThis.WorkshopTutorial = (() => {
  * 폰은 아래 탭 바, 데스크톱은 상단 메뉴가 탭 역할을 합니다. 전체 화면도 여기서 관리합니다. */
 globalThis.WorkshopNav = (() => {
   const W = {
-    ko: { play: '플레이', shop: '상점', collection: '컬렉션', rules: '규칙', s1: '×1', s2: '×2', exit: '나가기', fsOff: '전체 화면 끄기', aBoard: '공방 원탁 3D 화면', aPiles: '덱과 트래쉬', aLog: '진행 기록', aClose: '닫기' },
-    en: { play: 'Play', shop: 'Shop', collection: 'Collection', rules: 'Rules', s1: '×1', s2: '×2', exit: 'Exit', fsOff: 'Exit full screen', aBoard: 'Workshop 3D table', aPiles: 'Deck and trash', aLog: 'Game log', aClose: 'Close' },
-    ja: { play: 'プレイ', shop: 'ショップ', collection: 'コレクション', rules: 'ルール', s1: '×1', s2: '×2', exit: '退出', fsOff: '全画面を終了', aBoard: '工房の円卓 3D 画面', aPiles: 'デッキとトラッシュ', aLog: '進行記録', aClose: '閉じる' },
-    zh: { play: '游戏', shop: '商店', collection: '收藏', rules: '规则', s1: '×1', s2: '×2', exit: '退出', fsOff: '退出全屏', aBoard: '工坊圆桌 3D 画面', aPiles: '牌堆与弃牌堆', aLog: '对局记录', aClose: '关闭' }
+    ko: { play: '플레이', shop: '상점', collection: '컬렉션', rules: '규칙', s1: '×1', s2: '×2', exit: '나가기', fsOff: '전체 화면 끄기', aBoard: '공방 원탁 3D 화면', aPiles: '덱과 트래쉬', aLog: '진행 기록', aClose: '닫기', aSpeed: '속도' },
+    en: { play: 'Play', shop: 'Shop', collection: 'Collection', rules: 'Rules', s1: '×1', s2: '×2', exit: 'Exit', fsOff: 'Exit full screen', aBoard: 'Workshop 3D table', aPiles: 'Deck and trash', aLog: 'Game log', aClose: 'Close', aSpeed: 'Speed' },
+    ja: { play: 'プレイ', shop: 'ショップ', collection: 'コレクション', rules: 'ルール', s1: '×1', s2: '×2', exit: '退出', fsOff: '全画面を終了', aBoard: '工房の円卓 3D 画面', aPiles: 'デッキとトラッシュ', aLog: '進行記録', aClose: '閉じる', aSpeed: '速度' },
+    zh: { play: '游戏', shop: '商店', collection: '收藏', rules: '规则', s1: '×1', s2: '×2', exit: '退出', fsOff: '退出全屏', aBoard: '工坊圆桌 3D 画面', aPiles: '牌堆与弃牌堆', aLog: '对局记录', aClose: '关闭', aSpeed: '速度' }
   };
   const L = globalThis.WorkshopI18n;
   const w = k => (W[L?.lang] || W.ko)[k];
@@ -3167,7 +3253,7 @@ globalThis.WorkshopNav = (() => {
   }
   function aria() {
     const set = (sel, k) => document.querySelector(sel)?.setAttribute('aria-label', w(k));
-    set('#scene', 'aBoard'); set('#pile-panel', 'aPiles'); set('#log-drawer', 'aLog'); set('#pile-close', 'aClose');
+    set('#scene', 'aBoard'); set('#pile-panel', 'aPiles'); set('#log-drawer', 'aLog'); set('#pile-close', 'aClose'); const sp = document.querySelector('.speed-label .sr-only'); if (sp) sp.textContent = w('aSpeed');
   }
   function paint() {
     paintTop(); fsLabel(); aria();
@@ -3528,7 +3614,9 @@ const U = {
   iHand:'{b} 的手牌',iOne:'{b} 的原石',iCount:'{b} 的{mat}: {n} 张',iDeck:'牌堆剩余原石',iTop:'牌堆顶',iPeek:'{b} 查看的牌',iKind:'{b} 拿走的牌',empty:'无',
   lGain:'{a} · 获得 {n} 张原石',lDeck:'{a} · 将 {n} 张原石洗入牌堆',lGive:'{a} → {b} · 1 张原石',lReveal:'{a} 公开: {list}',lSwap:'{a} ↔ {b} · 交换原石',lLook:'{a} · 查看了 {b} 的手牌',lRedirect:'目标改为 → {b}',lHold:'{a} · 保留{item}',lProt:'{a} · 获得保护',lHammerBlock:'{b} 的保护挡住了锤子',lDeckCtl:'{a} · 整理了牌堆顶',lMelt:'{a} · 把 {b} 的盾变成 2 张蓝原石',lReturn:'{a} · 交回盾牌换取蓝原石',lView:'{a} · 下回合查看张数 +{n}',lPass:'所有人向左传 1 张原石',lMull:'{a} · 重新查看',lExtra:'{a} · 多拿 1 张',lTrashDeck:'{a} · 将弃牌堆 3 张原石洗入牌堆',lRelease:'{a} · 使用保留的{item}',lNext:'{a} · 偷看下一位玩家',lMine:'我的角色卡',lNone:'未装备角色卡',lUsed:'本回合已使用',lReady:'待命',lInfo:'{a} · 获得情报'}
 };
-const W=(k,p={})=>String((U[L.lang]||U.ko)[k]??U.ko[k]??k).replace(/\{(\w+)\}/g,(_,x)=>p[x]??'');
+const W0=(l,k,p)=>String((U[l]||U.ko)[k]??U.ko[k]??k).replace(/\{(\w+)\}/g,(_,x)=>p[x]??'');
+// 온라인 대전: 다른 플레이어가 자기 언어로 볼 수 있게 네 언어 번역을 함께 들고 다닙니다
+const W=(k,p={})=>{if(!NETMODE)return W0(L.lang,k,p);const s=new String(W0(L.lang,k,p));s.__ml={};for(const l of ['ko','en','ja','zh'])s.__ml[l]=W0(l,k,p);return s};
 let NETMODE=false,REMOTE={},ELIM=[];const isHuman=p=>p===USER||!!REMOTE[p];
 const who=i=>!NETMODE&&i===USER?T('me'):S(i);
 const matList=h=>{const out=[0,1,2].filter(c=>h[c]>0).map(c=>`${MAT[c]} ${h[c]}`);return out.length?out.join(' · '):W('empty')};
@@ -3896,35 +3984,47 @@ async function run(){
 // ───────── 랭크 대전: 다른 플레이어와 실시간 대전 ─────────
 // 방장(host) 화면이 게임을 진행하고, 다른 플레이어는 상태를 받아 그리며 자기 선택만 보냅니다.
 const RKS = {
- ko:{open:'랭크 대전',title:'랭크 대전',lede:'다른 플레이어와 같은 원탁에 앉아요. 빈자리는 캐릭터 카드를 장착한 AI가 채우고, 탈락 순서대로 점수가 정해져요.',back:'로비로',online:'지금 {n}명 접속 중',noRoom:'이 화면에서는 다른 플레이어와 연결할 수 없어요. Claude에 로그인한 상태로 열어 주세요.',
+ ko:{stopped:'게임 중단',open:'랭크 대전',title:'랭크 대전',lede:'다른 플레이어와 같은 원탁에 앉아요. 빈자리는 캐릭터 카드를 장착한 AI가 채우고, 탈락 순서대로 점수가 정해져요.',back:'로비로',online:'지금 {n}명 접속 중',noRoom:'이 화면에서는 다른 플레이어와 연결할 수 없어요. Claude에 로그인한 상태로 열어 주세요.',
   create:'방 만들기',join:'참가',full:'가득 참',leave:'나가기',start:'시작하기',needTwo:'2명 이상 모이면 시작할 수 있어요',tables:'열린 방',noTables:'열린 방이 없어요. 방을 만들어 친구를 기다려 보세요.',host:'방장',you:'나',ai:'AI',inTable:'내 방 · {n}/6명',waiting:'방장이 시작하기를 기다리는 중…',
   board:'랭킹',noBoard:'아직 기록이 없어요.',pts:'{n}점',games:'{n}판',wins:'{n}승',myRank:'내 점수',ptsRule:'1위 +30 · 2위 +18 · 3위 +10 · 4위 +4 · 5위 −4 · 6위 −10 (시작 1000점)',share:'친구도 하려면 공유 메뉴에서 참여자 이상 권한으로 이 페이지를 공유해 주세요.',
   hostLeft:'방장이 나가서 게임이 끝났어요. 점수는 기록되지 않아요.',dropped:'{a} 연결이 끊겨 AI가 대신해요',result:'랭크 결과',place:'{n}위',someone:'플레이어',again:'랭크 로비로',saving:'점수 기록 중…',saved:'점수를 기록했어요',saveFail:'점수를 기록하지 못했어요',timer:'{n}초 안에 고르지 않으면 AI가 대신 골라요',mode:'랭크 대전'},
- en:{open:'Ranked match',title:'Ranked match',lede:'Sit at the same table with other players. AI with character cards fill the empty seats, and points follow the order of elimination.',back:'Lobby',online:'{n} online now',noRoom:'This view can’t connect to other players. Open the page while signed in to Claude.',
+ en:{stopped:'Game stopped',open:'Ranked match',title:'Ranked match',lede:'Sit at the same table with other players. AI with character cards fill the empty seats, and points follow the order of elimination.',back:'Lobby',online:'{n} online now',noRoom:'This view can’t connect to other players. Open the page while signed in to Claude.',
   create:'Create table',join:'Join',full:'Full',leave:'Leave',start:'Start',needTwo:'You can start once 2 or more players are here',tables:'Open tables',noTables:'No open tables. Create one and wait for friends.',host:'Host',you:'You',ai:'AI',inTable:'My table · {n}/6',waiting:'Waiting for the host to start…',
   board:'Leaderboard',noBoard:'No records yet.',pts:'{n} pts',games:'{n} games',wins:'{n} wins',myRank:'My points',ptsRule:'1st +30 · 2nd +18 · 3rd +10 · 4th +4 · 5th −4 · 6th −10 (start at 1000)',share:'For friends to play, share this page with them at Contributor or higher.',
   hostLeft:'The host left, so the game ended. No points were recorded.',dropped:'{a} disconnected · AI takes over',result:'Ranked results',place:'#{n}',someone:'Player',again:'Ranked lobby',saving:'Recording points…',saved:'Points recorded',saveFail:'Couldn’t record points',timer:'AI picks for you after {n}s',mode:'Ranked'},
- ja:{open:'ランク戦',title:'ランク戦',lede:'他のプレイヤーと同じ円卓に座ります。空席はキャラクターカードを装備したAIが埋め、脱落した順にポイントが決まります。',back:'ロビーへ',online:'{n}人が接続中',noRoom:'この画面では他のプレイヤーと接続できません。Claude にログインした状態で開いてください。',
+ ja:{stopped:'ゲーム中断',open:'ランク戦',title:'ランク戦',lede:'他のプレイヤーと同じ円卓に座ります。空席はキャラクターカードを装備したAIが埋め、脱落した順にポイントが決まります。',back:'ロビーへ',online:'{n}人が接続中',noRoom:'この画面では他のプレイヤーと接続できません。Claude にログインした状態で開いてください。',
   create:'部屋を作る',join:'参加',full:'満員',leave:'退出',start:'開始',needTwo:'2人以上集まると開始できます',tables:'開いている部屋',noTables:'開いている部屋がありません。部屋を作って友だちを待ちましょう。',host:'ホスト',you:'自分',ai:'AI',inTable:'自分の部屋 · {n}/6人',waiting:'ホストの開始を待っています…',
   board:'ランキング',noBoard:'まだ記録がありません。',pts:'{n}点',games:'{n}戦',wins:'{n}勝',myRank:'自分のポイント',ptsRule:'1位 +30 · 2位 +18 · 3位 +10 · 4位 +4 · 5位 −4 · 6位 −10(初期1000点)',share:'友だちも遊ぶには、共有メニューで参加者以上の権限で共有してください。',
   hostLeft:'ホストが退出したためゲームが終了しました。ポイントは記録されません。',dropped:'{a} の接続が切れたためAIが代わります',result:'ランク結果',place:'{n}位',someone:'プレイヤー',again:'ランクロビーへ',saving:'ポイント記録中…',saved:'ポイントを記録しました',saveFail:'ポイントを記録できませんでした',timer:'{n}秒以内に選ばないとAIが代わりに選びます',mode:'ランク戦'},
- zh:{open:'排位赛',title:'排位赛',lede:'与其他玩家坐在同一张圆桌。空位由装备角色卡的 AI 补上，按淘汰顺序计分。',back:'返回大厅',online:'当前 {n} 人在线',noRoom:'此页面无法连接其他玩家。请登录 Claude 后打开。',
+ zh:{stopped:'游戏中止',open:'排位赛',title:'排位赛',lede:'与其他玩家坐在同一张圆桌。空位由装备角色卡的 AI 补上，按淘汰顺序计分。',back:'返回大厅',online:'当前 {n} 人在线',noRoom:'此页面无法连接其他玩家。请登录 Claude 后打开。',
   create:'创建房间',join:'加入',full:'已满',leave:'离开',start:'开始',needTwo:'2 人以上即可开始',tables:'开放的房间',noTables:'没有开放的房间。创建一个等朋友加入吧。',host:'房主',you:'我',ai:'AI',inTable:'我的房间 · {n}/6',waiting:'等待房主开始…',
   board:'排行榜',noBoard:'还没有记录。',pts:'{n} 分',games:'{n} 局',wins:'{n} 胜',myRank:'我的积分',ptsRule:'第1名 +30 · 第2名 +18 · 第3名 +10 · 第4名 +4 · 第5名 −4 · 第6名 −10(初始 1000 分)',share:'朋友要一起玩，请在分享菜单中以参与者及以上权限分享此页面。',
   hostLeft:'房主已离开，游戏结束。不记录积分。',dropped:'{a} 已断线 · 由 AI 接管',result:'排位结果',place:'第{n}名',someone:'玩家',again:'返回排位大厅',saving:'正在记录积分…',saved:'积分已记录',saveFail:'无法记录积分',timer:'{n} 秒内未选择将由 AI 代选',mode:'排位赛'}
 };
+// 친선 배틀(서버 버전): 점수·랭킹 없이 같이 플레이만 합니다
+const FRIENDLY=!!globalThis.WORKSHOP_FRIENDLY;
+if(FRIENDLY){const F={
+ ko:{open:'친선 배틀',title:'친선 배틀',lede:'가입한 사람끼리 방을 만들어 같은 원탁에서 겨뤄요. 빈자리는 캐릭터 카드를 장착한 AI가 채워요. 점수는 기록되지 않아요.',noRoom:'친선 배틀은 로그인해야 할 수 있어요. 오른쪽 위 로그인 버튼을 눌러 주세요.',hostLeft:'방장이 나가서 게임이 끝났어요.',result:'친선 배틀 결과',again:'친선 배틀 로비로',mode:'친선 배틀',share:'친구에게 이 사이트 주소를 보내고, 가입한 뒤 방에 참가하라고 알려 주세요.'},
+ en:{open:'Friendly battle',title:'Friendly battle',lede:'Signed-up players create a table and play at the same round table. AI with character cards fill empty seats. No points are recorded.',noRoom:'Log in to play friendly battles. Use the Log in button at the top right.',hostLeft:'The host left, so the game ended.',result:'Friendly battle results',again:'Friendly battle lobby',mode:'Friendly battle',share:'Send friends this site’s address and ask them to sign up and join your table.'},
+ ja:{open:'フレンド対戦',title:'フレンド対戦',lede:'登録した人同士で部屋を作り、同じ円卓で対戦します。空席はキャラクターカードを装備したAIが埋めます。ポイントは記録されません。',noRoom:'フレンド対戦はログインすると遊べます。右上のログインボタンを押してください。',hostLeft:'ホストが退出したためゲームが終了しました。',result:'フレンド対戦の結果',again:'フレンド対戦ロビーへ',mode:'フレンド対戦',share:'友だちにこのサイトのアドレスを送り、登録して部屋に参加してもらいましょう。'},
+ zh:{open:'友谊赛',title:'友谊赛',lede:'注册玩家创建房间，坐在同一张圆桌对战。空位由装备角色卡的 AI 补上。不记录积分。',noRoom:'登录后才能进行友谊赛。请点击右上角的登录按钮。',hostLeft:'房主已离开，游戏结束。',result:'友谊赛结果',again:'返回友谊赛大厅',mode:'友谊赛',share:'把本网站地址发给朋友，请他们注册后加入你的房间。'}};
+ for(const k in F)Object.assign(RKS[k],F[k])}
 const RW=(k,p={})=>String((RKS[L.lang]||RKS.ko)[k]??RKS.ko[k]).replace(/\{(\w+)\}/g,(_,x)=>p[x]??'');
 const escH=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const RANK_PTS=[30,18,10,4,-4,-10],ASK_MS=45000;
 let NET=null,NAMES={},roomApi=null,userApi=null,dbApi=null,myId=null,myPeer=null,lobbyPeers=[],table=null,boardRows=[],myRank=null,rankUnsub=null;
 const rp=()=>q('rank-panel');
 function charById(id){return id?(globalThis.WorkshopCharacters||[]).find(c=>c.id===id)||null:null}
+let netBusy=false;
 async function netInit(){
+ if(netBusy)return;netBusy=true;try{await netInit0()}finally{netBusy=false}
+}
+async function netInit0(){
  const c=globalThis.claude;if(!c?.use){paintRank();return}
  try{[roomApi,userApi,dbApi]=await Promise.all([c.use('room'),c.use('user'),c.use('db')])}catch(e){}
  try{myId=userApi?(await userApi.me()).id:null}catch(e){}
  if(roomApi){
-  roomApi.onPeers(ch=>{lobbyPeers=ch.peers;const me=ch.peers.find(p=>p.sameTab);if(me)myPeer=me.peer;paintRank()},()=>{roomApi=null;paintRank()});
+  roomApi.onPeers(ch=>{lobbyPeers=ch.peers;const me=ch.peers.find(p=>p.sameTab);if(me)myPeer=me.peer;paintRank()},()=>{roomApi=null;lobbyPeers=[];if(!NET)table=null;paintRank()});
   setLobbyPresence();
  }
  if(dbApi){
@@ -3952,7 +4052,7 @@ async function leaveTable(){if(!table)return;const t=table;table=null;try{await 
 function onTablePeers(ch){
  if(!NET||!table)return;
  const gone=ch.left.map(p=>p.peer);if(!gone.length)return;
- if(NET.role==='client'&&gone.includes(table.hostPeer)){NET.dead=true;ended=true;prompt=null;busy=false;logs.push(()=>RW('hostLeft'));q('ps-status').textContent=RW('hostLeft');render();return}
+ if(NET.role==='client'&&gone.includes(table.hostPeer)){NET.dead=true;ended=true;prompt=null;busy=false;globalThis.WorkshopEndNote=RW('hostLeft');globalThis.WorkshopEndTitle=RW('stopped');logs.push(()=>RW('hostLeft'));render();q('ps-status').textContent=RW('hostLeft');const rb=document.getElementById('end-reward');if(rb){rb.hidden=true}return}
  if(NET.role==='host')for(const s in REMOTE){if(gone.includes(REMOTE[s].peer)){const seat=+s;delete REMOTE[seat];log(()=>RW('dropped',{a:S(seat)}));for(const id in NET.pending)if(NET.pending[id].p===seat)NET.finish(id,null)}}
 }
 // ── 시작 ──
@@ -3969,7 +4069,7 @@ async function hostStart(){
 function startNet(setup,isHost){
  const seats=Array.isArray(setup.seats)?setup.seats.slice(0,6):[];const me=seats.findIndex(s=>s&&s.peer===myPeer);if(me<0)return;
  runId++;active=true;busy=true;ended=false;prompt=null;viewState=null;currentFrame=null;currentActor=null;logs.length=0;
- NETMODE=true;charMode=true;difficulty='normal';playLevel='rank';ELIM=[];REMOTE={};
+ globalThis.WorkshopEndNote='';globalThis.WorkshopEndTitle='';NETMODE=true;charMode=true;difficulty='normal';playLevel='rank';ELIM=[];REMOTE={};
  USER=me;ORDER=Array.isArray(setup.order)&&setup.order.length===6?setup.order.map(Number):[0,1,2,3,4,5];USERPOS=ORDER.indexOf(USER);
  NET={role:isHost?'host':'client',seats,pending:{},seq:0,sent:0,lastSt:'',dead:false,res:null,finish:null};
  if(isHost)seats.forEach((s,i)=>{if(s&&i!==USER)REMOTE[i]={peer:s.peer,by:s.by}});
@@ -3985,13 +4085,18 @@ function startNet(setup,isHost){
  if(isHost){NET.finish=(id,v)=>{const pd=NET.pending[id];if(!pd)return;delete NET.pending[id];clearTimeout(pd.t);clearInterval(pd.r);pd.res(v)};run()}
 }
 // ── 방장: 상태 방송 ──
-function netMeta(){const out=[];while(NET.sent<logs.length&&out.length<8){const t=logs[NET.sent++];try{out.push(String(typeof t==='function'?t():t).slice(0,240))}catch(e){}}
- return {a:currentActor,at:actionText?String(typeof actionText==='function'?actionText():actionText):'',u:FX.map(f=>f&&f.usedTurn===g.turn?1:0),hd:FX.map(f=>f?f.held.findIndex(Boolean):-1),lg:out,e:ended?1:0}}
+// 방장이 보내는 글: 네 언어로 만들어 보내고, 받는 쪽은 자기 언어를 고릅니다
+const MLS=['ko','en','ja','zh'];
+function mlOf(t){const one=l=>{try{return String(L.withLang?L.withLang(l,()=>typeof t==='function'?t():t):(typeof t==='function'?t():t)).slice(0,240)}catch(e){return ''}};const o={};for(const l of MLS)o[l]=one(l);return o}
+const pickML=x=>x&&typeof x==='object'?String(x[L.lang]||x.ko||''):String(x??'');
+const packML=x=>x&&x.__ml?{...x.__ml}:x;
+function netMeta(){const out=[];while(NET.sent<logs.length&&out.length<8){const t=logs[NET.sent++];out.push(mlOf(t))}
+ return {a:currentActor,at:actionText?mlOf(actionText):'',u:FX.map(f=>f&&f.usedTurn===g.turn?1:0),hd:FX.map(f=>f?f.held.findIndex(Boolean):-1),lg:out,e:ended?1:0}}
 function emitSafe(topic,data){try{table?.room?.emit(topic,data).catch(()=>{})}catch(e){}}
 globalThis.__netFrame=frame=>{if(!NET||NET.role!=='host')return;const {kind,state,...d}=frame;emitSafe('f',{k:kind,d,s:state,...netMeta()})};
 let pushT=0;
 function netPush(){if(!NET||NET.role!=='host'||NET.dead)return;clearTimeout(pushT);pushT=setTimeout(()=>{if(!NET)return;const m={s:g,...netMeta()};const key=JSON.stringify([m.s,m.a,m.at,m.u,m.hd,m.e]);if(key===NET.lastSt&&!m.lg.length)return;NET.lastSt=key;emitSafe('st',m)},120)}
-function packReq(req){const o={type:req.type};for(const k of ['title','options','counts','cards','legal','offer','text','purpose'])if(req[k]!==undefined)o[k]=k==='options'&&req.type==='choice'?req.options.map(x=>({label:x.label,value:x.value})):req[k];if(req.char)o.charId=req.char.id;return o}
+function packReq(req){const o={type:req.type};for(const k of ['title','options','counts','cards','legal','offer','text','purpose'])if(req[k]!==undefined)o[k]=k==='options'&&req.type==='choice'?req.options.map(x=>({label:packML(x.label),value:x.value})):(k==='title'||k==='text')?packML(req[k]):req[k];if(req.char)o.charId=req.char.id;return o}
 globalThis.__askRemote=(p,req)=>new Promise(res=>{
  const id=++NET.seq,msg={id,seat:p,req:packReq(req),ms:ASK_MS};
  const pd={p,req,res:v=>res(validAns(p,req,v))};NET.pending[id]=pd;
@@ -4015,7 +4120,7 @@ function validAns(p,req,box){
  return fb();
 }
 // ── 참가자: 받아서 그리기 ──
-function applyMeta(m){if(Array.isArray(m.lg))m.lg.forEach(t=>logs.push(String(t)));currentActor=Number.isInteger(m.a)?m.a:null;actionText=m.at?(()=>m.at):'';
+function applyMeta(m){if(Array.isArray(m.lg))m.lg.forEach(t=>logs.push(()=>pickML(t)));currentActor=Number.isInteger(m.a)?m.a:null;actionText=m.at?(()=>pickML(m.at)):'';
  FX=Array.from({length:6},(_,i)=>({...newFx(),usedTurn:m.u&&m.u[i]?(g?.turn??0):-1,held:[0,1,2].map(k=>m.hd&&m.hd[i]===k)}));if(m.e)ended=true}
 function goodState(s){return s&&Array.isArray(s.deck)&&Array.isArray(s.h)&&s.h.length===6&&Array.isArray(s.hp)&&Array.isArray(s.slots)&&Array.isArray(s.spent)}
 function netClientMsg(m,kind){
@@ -4031,7 +4136,7 @@ let clientAsk=null;
 function netClientAsk(m){
  if(!NET||NET.role!=='client'||!table||m.peer!==table.hostPeer)return;const d=m.data||{};if(d.seat!==USER||!d.req)return;
  if(clientAsk&&clientAsk.id===d.id)return;
- const r=d.req,req={type:String(r.type),title:String(r.title||''),options:Array.isArray(r.options)?r.options:[],counts:r.counts,cards:Array.isArray(r.cards)?r.cards:[],legal:Array.isArray(r.legal)?r.legal:[],offer:Array.isArray(r.offer)?r.offer:[],text:r.text?String(r.text):'',char:charById(r.charId)};
+ const r=d.req,req={type:String(r.type),title:pickML(r.title||''),options:Array.isArray(r.options)?(r.type==='choice'?r.options.map(o=>({...o,label:pickML(o.label)})):r.options):[],counts:r.counts,cards:Array.isArray(r.cards)?r.cards:[],legal:Array.isArray(r.legal)?r.legal:[],offer:Array.isArray(r.offer)?r.offer:[],text:r.text?pickML(r.text):'',char:charById(r.charId)};
  if(req.type==='confirm'&&!req.char)return;
  clientAsk={id:d.id,until:Date.now()+(d.ms||ASK_MS)};prompt=null;
  askUser(req).then(v=>{if(!clientAsk||clientAsk.id!==d.id)return;clientAsk=null;emitSafe('ans',{id:d.id,v})});
@@ -4051,7 +4156,8 @@ async function showResult(res){
  const box=document.getElementById('end-reward');if(!box)return;
  const mine=res[USER];
  const rows=ORDER.map(i=>i).sort((a,b)=>res[a].place-res[b].place);
- const draw=st=>{box.hidden=false;box.innerHTML=`<div class="er-head"><b>${escH(RW('place',{n:mine.place}))}</b><span>${mine.pts>=0?'+':''}${mine.pts}</span></div><ul>${rows.map(i=>`<li${i===USER?' class="sum"':''}><span>${escH(RW('place',{n:res[i].place}))} · ${escH(S(i))}</span><b>${res[i].pts>=0?'+':''}${res[i].pts}</b></li>`).join('')}</ul><p class="er-note">${escH(st||'')}</p>`};
+ const pt=n=>FRIENDLY?'':(n>=0?'+':'')+n;
+ const draw=st=>{box.hidden=false;box.innerHTML=`<div class="er-head"><b>${escH(RW('place',{n:mine.place}))}</b><span>${pt(mine.pts)}</span></div><ul>${rows.map(i=>`<li${i===USER?' class="sum"':''}><span>${escH(RW('place',{n:res[i].place}))} · ${escH(S(i))}</span><b>${pt(res[i].pts)}</b></li>`).join('')}</ul><p class="er-note">${escH(st||'')}</p>`};
  draw(myId&&dbApi?RW('saving'):'');
  if(!myId||!dbApi||NET.recorded)return;NET.recorded=true;
  try{const ref=dbApi.doc('rank/'+myId);const s=await ref.get();const o=s.exists?s.data():{};
@@ -4081,7 +4187,8 @@ ${isHost?`<button type="button" class="start-button" data-rk="start"${table.memb
  el.querySelector('.rk-online').textContent=roomApi?RW('online',{n:viewers.length||1}):'';
  el.querySelector('.rk-me').innerHTML=myRank?`<span>${escH(RW('myRank'))}</span><b>${escH(RW('pts',{n:myRank.pts}))}</b><small>${escH(RW('games',{n:myRank.games||0}))} · ${escH(RW('wins',{n:myRank.wins||0}))}</small>`:'';
  el.querySelector('.rk-board').innerHTML=`<h3>${escH(RW('board'))}</h3>${boardRows.length?`<ol>${boardRows.map((r,i)=>`<li${r.id===myId?' class="me"':''}><span class="rk-pos">${i+1}</span><span class="rk-nm">${escH(r.id===myId?RW('you'):nm(r.id))}</span><small>${escH(RW('games',{n:r.games||0}))}</small><b>${escH(RW('pts',{n:Math.round(+r.pts||0)}))}</b></li>`).join('')}</ol>`:`<p class="rk-none">${escH(RW('noBoard'))}</p>`}`;
- el.querySelector('[data-rkt="title"]').textContent=RW('title');el.querySelector('[data-rkt="lede"]').textContent=RW('lede');el.querySelector('[data-rkt="rule"]').textContent=RW('ptsRule');el.querySelector('[data-rkt="share"]').textContent=RW('share');el.querySelector('[data-rk="back"]').textContent=RW('back');
+ el.classList.toggle('friendly',FRIENDLY);if(FRIENDLY){el.querySelector('.rk-board').innerHTML='';el.querySelector('.rk-me').innerHTML=''}
+ el.querySelector('[data-rkt="title"]').textContent=RW('title');el.querySelector('[data-rkt="lede"]').textContent=RW('lede');el.querySelector('[data-rkt="rule"]').textContent=FRIENDLY?'':RW('ptsRule');el.querySelector('[data-rkt="share"]').textContent=RW('share');el.querySelector('[data-rk="back"]').textContent=RW('back');
 }
 function openRank(){q('lobby').hidden=true;rp().hidden=false;paintRank()}
 function closeRank(){rp().hidden=true;q('lobby').hidden=false}
@@ -4092,6 +4199,7 @@ document.getElementById('end-again')?.addEventListener('click',e=>{if(playLevel=
 document.getElementById('end-lobby')?.addEventListener('click',()=>{},true);
 L.onChange(()=>{const b=q('rank-open');if(b)b.textContent=RW('open');paintRank()});
 {const b=q('rank-open');if(b)b.textContent=RW('open')}
+globalThis.addEventListener?.('workshop-auth',()=>{if(!roomApi)netInit();else if(FRIENDLY)paintRank()});
 netInit();
 
 // ── 화면 ──
@@ -4119,7 +4227,9 @@ function renderPrompt(){
 }
 const SEATCOL=['#f0a04a','#7fc4a0','#e2706a','#8fb0f0','#d7a0e8','#e8d27a'];
 function aiNo(i){return (ORDER.indexOf(i)-ORDER.indexOf(USER)+6)%6}
-function seatName(i){if(NETMODE)return NAMES[i]||('AI '+aiNo(i));return i===USER?T('me'):'AI '+aiNo(i)}
+// 온라인 대전: AI 번호를 모든 화면에서 같게 (턴 순서대로 AI 1, AI 2 …)
+function netAiNo(i){const hs=typeof NET!=='undefined'&&NET&&NET.seats||[];return ORDER.filter(j=>!hs[j]).indexOf(i)+1}
+function seatName(i){if(NETMODE){if(NAMES[i])return NAMES[i];const hs=typeof NET!=='undefined'&&NET&&NET.seats||[];return hs[i]?(typeof RW==='function'?RW('someone'):'…'):'AI '+netAiNo(i)}return i===USER?T('me'):'AI '+aiNo(i)}
 L.setSeatNamer?.(i=>active?seatName(i):null);
 // 원형 턴 순서: 3D 원탁과 같은 배치(나는 아래, 시계 방향)
 function turnMap(st){
@@ -4145,7 +4255,7 @@ function render(){
  renderPrompt();
  if(NETMODE&&clientAsk&&prompt&&!busy){const pr=q('ps-prompt');pr.textContent+=' · '+RW('timer',{n:Math.max(0,Math.round((clientAsk.until-Date.now())/1000))})}
  netPush();
- if(!globalThis.Workshop3D){const ep=document.getElementById('end-panel');if(ep){if(ended&&ep.hidden){const win=g.hp[USER]&&alive(g).length===1,lost=!g.hp[USER];document.getElementById('end-title').textContent=T(win?'end.win':lost?'end.lose':'end.draw');document.getElementById('end-kicker').textContent=T(win?'end.kWin':lost?'end.kLose':'end.kDraw');document.getElementById('end-text').textContent=''}ep.hidden=!ended}}
+ if(!globalThis.Workshop3D){const ep=document.getElementById('end-panel');if(ep){if(ended&&ep.hidden){const win=g.hp[USER]&&alive(g).length===1,lost=!g.hp[USER];document.getElementById('end-title').textContent=T(win?'end.win':lost?'end.lose':'end.draw');document.getElementById('end-kicker').textContent=T(win?'end.kWin':lost?'end.kLose':'end.kDraw');document.getElementById('end-text').textContent=globalThis.WorkshopEndNote||'';if(globalThis.WorkshopEndTitle)document.getElementById('end-title').textContent=globalThis.WorkshopEndTitle}ep.hidden=!ended}}
 }
 const diffLabel=()=>T('diff.label',{level:(charMode?T('mode.char')+' · ':'')+T('diff.'+difficulty)});
 // 캐릭터 카드 대전 AI의 등급 분포(%): 쉬움은 낮은 등급, 어려움은 높은 등급
@@ -4157,7 +4267,7 @@ function pickBotChars(){const all=globalThis.WorkshopCharacters||[];if(!all.leng
  const list=all.filter(c=>c.rarity===tier);return list[rand(list.length)]}
 function showLobby(){
  netLeave();runId++;active=false;busy=false;prompt=null;viewState=null;currentFrame=null;currentActor=null;
- setInGame(false);q('lobby').hidden=false;q('game-screen').hidden=true;q('new-game').hidden=true;q('lobby-art').innerHTML=[0,1,2].map(i=>visuals.card(i)).join('');globalThis.Workshop3D?.lobby();
+ setInGame(false);globalThis.WorkshopEndNote='';globalThis.WorkshopEndTitle='';q('lobby').hidden=false;q('game-screen').hidden=true;q('new-game').hidden=true;q('lobby-art').innerHTML=[0,1,2].map(i=>visuals.card(i)).join('');globalThis.Workshop3D?.lobby();
  globalThis.WorkshopShop?.paintLobby?.();
 }
 function startGame(level){
