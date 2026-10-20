@@ -24,6 +24,7 @@ async function hashPw(pw, saltHex) {
   const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: PBKDF2_ITER }, key, 256);
   return hex(bits);
 }
+const sha = async t => hex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(t))));
 function sameHex(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
   const ea = new TextEncoder().encode(a), eb = new TextEncoder().encode(b);
@@ -106,6 +107,20 @@ export class Store extends DurableObject {
     return { token: this.newSession(id), user: { id: u.id, name: u.name } };
   }
   whoami(token) { return this.auth(token); }
+  // 관리자 통계: 가입자 수, 최근 가입, 저장 기록
+  stats() {
+    const now = Date.now(), day = 864e5;
+    const n = q => this.row(q)?.n ?? 0;
+    const since = t => this.row('SELECT COUNT(*) AS n FROM users WHERE created >= ?', t)?.n ?? 0;
+    const recent = this.sql.exec('SELECT name, created FROM users ORDER BY created DESC LIMIT 30').toArray();
+    const top = this.sql.exec("SELECT u.name AS name, json_extract(s.data, '$.gold.total') AS gold, json_extract(s.data, '$.gold.wins') AS wins, s.at AS at FROM saves s JOIN users u ON u.id = s.uid ORDER BY s.at DESC LIMIT 30").toArray();
+    return {
+      users: n('SELECT COUNT(*) AS n FROM users'), today: since(now - day), week: since(now - 7 * day),
+      activeWeek: this.row('SELECT COUNT(*) AS n FROM saves WHERE at >= ?', now - 7 * day)?.n ?? 0,
+      sessions: this.row('SELECT COUNT(DISTINCT uid) AS n FROM sessions WHERE exp >= ?', now)?.n ?? 0,
+      recent, lastPlayed: top
+    };
+  }
   logout(token) { this.sql.exec('DELETE FROM sessions WHERE token = ?', String(token || '')); return { ok: true }; }
 
   load(token) {
@@ -186,6 +201,12 @@ export class Room extends DurableObject {
   }
   async webSocketClose(ws, code) { this.gone(ws); try { ws.close(code === 1005 ? 1000 : code, 'bye'); } catch (e) {} }
   async webSocketError(ws) { this.gone(ws); }
+  stats() {
+    const list = this.ctx.getWebSockets().map(w => this.info(w)).filter(Boolean);
+    const users = [...new Set(list.map(a => a.name))];
+    const tables = list.filter(a => a.rooms[''] && a.rooms[''].rk && a.rooms[''].rk.h).map(a => ({ host: a.name, players: a.rooms[''].rk.n || 1, open: !!a.rooms[''].rk.o }));
+    return { online: users.length, onlineNames: users.slice(0, 50), tables };
+  }
 }
 
 export default {
@@ -199,6 +220,13 @@ export default {
       const text = await request.text();
       if (text.length > MAX_SAVE) return json({ error: 'tooBig' }, 413);
       try { body = text ? JSON.parse(text) : {}; } catch (e) { return json({ error: 'badJson' }, 400); }
+    }
+    // 관리자: Cloudflare 설정에 ADMIN_KEY 비밀값을 넣어 두면 /admin.html 에서 볼 수 있어요
+    if (url.pathname === '/api/admin/stats') {
+      const key = request.headers.get('x-admin-key') || '';
+      if (!env.ADMIN_KEY || !sameHex(await sha(key), await sha(env.ADMIN_KEY))) return json({ error: 'forbidden' }, 403);
+      const [a, b] = await Promise.all([store.stats(), env.ROOM.get(env.ROOM.idFromName('friendly')).stats()]);
+      return json({ ...a, ...b, at: Date.now() });
     }
     if (url.pathname === '/api/ws') {
       if (request.headers.get('upgrade') !== 'websocket') return json({ error: 'expectedWebsocket' }, 426);
