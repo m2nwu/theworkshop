@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>공방 관리자</title>
+<style>
+:root{--bg:#110e0c;--panel:#1c1713;--panel2:#241d17;--line:#3a3028;--text:#f1e8dc;--muted:#a39484;--gold:#e2c07c;--green:#4cbf6b;--red:#ef6b62}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,"Apple SD Gothic Neo","Noto Sans KR",sans-serif;-webkit-text-size-adjust:100%}
+main{max-width:960px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:24px;margin:0 0 4px}
+.sub{color:var(--muted);margin:0 0 20px;font-size:14px}
+.login{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}
+.login input{flex:1 1 220px;font:inherit;font-size:16px;color:var(--text);background:#14100d;border:1px solid var(--line);border-radius:10px;padding:11px 12px}
+.login input:focus{outline:none;border-color:var(--gold)}
+button{font:inherit;font-weight:800;border-radius:10px;padding:11px 18px;cursor:pointer;border:1px solid var(--line);background:var(--panel2);color:var(--text)}
+button.primary{background:var(--gold);color:#1a1209;border:0}
+.msg{min-height:1.4em;color:var(--red);font-weight:700;margin:-8px 0 16px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:20px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+.card small{display:block;color:var(--muted);font-size:12.5px;font-weight:700}
+.card b{display:block;font-size:30px;line-height:1.2;color:var(--gold);font-variant-numeric:tabular-nums}
+.card.live b{color:var(--green)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+section h2{font-size:15px;margin:0 0 10px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+td,th{padding:6px 4px;border-top:1px solid var(--line);text-align:left;font-variant-numeric:tabular-nums}
+th{color:var(--muted);font-size:12.5px;font-weight:700;border-top:0}
+td.r,th.r{text-align:right}
+.none{color:var(--muted);font-size:14px;margin:0}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chips span{background:var(--panel2);border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:13px}
+.foot{color:var(--muted);font-size:12.5px;margin-top:16px}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+  <h1>공방 관리자</h1>
+  <p class="sub">가입자 수와 지금 접속한 사람을 확인하는 페이지예요. 30초마다 새로 고쳐져요.</p>
+  <form class="login" id="login">
+    <input id="key" type="password" autocomplete="current-password" placeholder="관리자 키" required>
+    <button class="primary" type="submit">보기</button>
+    <button type="button" id="forget" hidden>키 지우기</button>
+  </form>
+  <p class="msg" id="msg" role="alert"></p>
+  <div id="out" hidden>
+    <div class="cards">
+      <div class="card"><small>전체 가입자</small><b id="c-users">0</b></div>
+      <div class="card"><small>오늘 가입 (24시간)</small><b id="c-today">0</b></div>
+      <div class="card"><small>이번 주 가입 (7일)</small><b id="c-week">0</b></div>
+      <div class="card"><small>이번 주 플레이한 계정</small><b id="c-active">0</b></div>
+      <div class="card live"><small>지금 접속 중</small><b id="c-online">0</b></div>
+      <div class="card live"><small>열린 친선 배틀 방</small><b id="c-tables">0</b></div>
+    </div>
+    <div class="grid">
+      <section><h2>지금 접속 중</h2><div id="online"></div></section>
+      <section><h2>친선 배틀 방</h2><div id="tables"></div></section>
+      <section><h2>최근 가입</h2><div id="recent"></div></section>
+      <section><h2>최근 플레이</h2><div id="played"></div></section>
+    </div>
+    <p class="foot" id="foot"></p>
+  </div>
+</main>
+<script>
+(() => {
+  const $ = id => document.getElementById(id), K = 'workshop-admin-key';
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const when = t => { if (!t) return ''; const d = (Date.now() - t) / 1000; if (d < 60) return '방금'; if (d < 3600) return Math.floor(d / 60) + '분 전'; if (d < 86400) return Math.floor(d / 3600) + '시간 전'; return new Date(t).toLocaleDateString('ko-KR', { month: 'short', day: 'numeric' }); };
+  let key = ''; try { key = localStorage.getItem(K) || ''; } catch (e) {}
+  let timer = 0;
+  async function load() {
+    if (!key) return;
+    try {
+      const r = await fetch('/api/admin/stats', { headers: { 'x-admin-key': key }, cache: 'no-store' });
+      if (r.status === 403) { $('msg').textContent = '키가 맞지 않거나, Cloudflare에 ADMIN_KEY가 아직 없어요.'; $('out').hidden = true; return; }
+      const d = await r.json();
+      $('msg').textContent = ''; $('out').hidden = false; $('forget').hidden = false;
+      $('c-users').textContent = d.users; $('c-today').textContent = d.today; $('c-week').textContent = d.week; $('c-active').textContent = d.activeWeek;
+      $('c-online').textContent = d.online; $('c-tables').textContent = d.tables.length;
+      $('online').innerHTML = d.onlineNames.length ? `<div class="chips">${d.onlineNames.map(n => `<span>${esc(n)}</span>`).join('')}</div>` : '<p class="none">지금 접속한 사람이 없어요.</p>';
+      $('tables').innerHTML = d.tables.length ? `<table><tr><th>방장</th><th class="r">인원</th><th class="r">상태</th></tr>${d.tables.map(t => `<tr><td>${esc(t.host)}</td><td class="r">${t.players}/6</td><td class="r">${t.open ? '대기 중' : '게임 중'}</td></tr>`).join('')}</table>` : '<p class="none">열린 방이 없어요.</p>';
+      $('recent').innerHTML = d.recent.length ? `<table><tr><th>아이디</th><th class="r">가입</th></tr>${d.recent.map(u => `<tr><td>${esc(u.name)}</td><td class="r">${when(u.created)}</td></tr>`).join('')}</table>` : '<p class="none">아직 가입한 사람이 없어요.</p>';
+      $('played').innerHTML = d.lastPlayed.length ? `<table><tr><th>아이디</th><th class="r">골드</th><th class="r">승리</th><th class="r">마지막 저장</th></tr>${d.lastPlayed.map(u => `<tr><td>${esc(u.name)}</td><td class="r">${(u.gold || 0).toLocaleString('ko-KR')}</td><td class="r">${u.wins || 0}</td><td class="r">${when(u.at)}</td></tr>`).join('')}</table>` : '<p class="none">아직 기록이 없어요.</p>';
+      $('foot').textContent = '마지막 확인: ' + new Date(d.at).toLocaleTimeString('ko-KR');
+    } catch (e) { $('msg').textContent = '서버에 연결하지 못했어요.'; }
+  }
+  $('login').addEventListener('submit', e => { e.preventDefault(); key = $('key').value.trim(); try { localStorage.setItem(K, key); } catch (x) {} $('key').value = ''; load(); });
+  $('forget').addEventListener('click', () => { key = ''; try { localStorage.removeItem(K); } catch (e) {} $('out').hidden = true; $('forget').hidden = true; });
+  load(); timer = setInterval(load, 30000);
+})();
+</script>
+</body>
+</html>
