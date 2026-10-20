@@ -1,0 +1,20 @@
+{
+  // 공방 THE WORKSHOP — Cloudflare 설정
+  // name을 바꾸면 사이트 주소(https://<name>.<계정>.workers.dev)도 바뀝니다.
+  "name": "workshop-game",
+  "main": "src/index.js",
+  "compatibility_date": "2025-09-01",
+  // 게임 페이지(public 폴더)는 그대로 보내 주고, 나머지(/api/*)는 src/index.js가 처리합니다
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  // 계정·저장 기록을 보관하는 저장소 (따로 만들 필요 없이 배포할 때 자동으로 생깁니다)
+  "durable_objects": {
+    "bindings": [{ "name": "STORE", "class_name": "Store" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Store"] }
+  ],
+  "observability": { "enabled": true }
+}
