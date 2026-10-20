@@ -9,12 +9,16 @@
     "directory": "./public",
     "binding": "ASSETS"
   },
-  // 계정·저장 기록을 보관하는 저장소 (따로 만들 필요 없이 배포할 때 자동으로 생깁니다)
+  // STORE: 계정·저장 기록 / ROOM: 친선 배틀 실시간 방 (따로 만들 필요 없이 배포할 때 자동으로 생깁니다)
   "durable_objects": {
-    "bindings": [{ "name": "STORE", "class_name": "Store" }]
+    "bindings": [
+      { "name": "STORE", "class_name": "Store" },
+      { "name": "ROOM", "class_name": "Room" }
+    ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["Store"] }
+    { "tag": "v1", "new_sqlite_classes": ["Store"] },
+    { "tag": "v2", "new_sqlite_classes": ["Room"] }
   ],
   "observability": { "enabled": true }
 }
