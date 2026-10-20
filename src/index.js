@@ -1,6 +1,7 @@
 // 공방 THE WORKSHOP — Cloudflare 서버
 // 게임 페이지(public/index.html)는 Cloudflare가 그대로 보내 주고, /api/* 요청만 이 코드가 처리합니다.
 // 계정·로그인 세션·저장 기록은 Durable Object(Store) 안의 SQLite에 보관합니다.
+// 친선 배틀의 실시간 방은 Durable Object(Room)가 웹소켓으로 이어 줍니다.
 import { DurableObject } from 'cloudflare:workers';
 
 // 골드 코드: 서버에만 있어서 페이지 소스를 봐도 보이지 않습니다. 한 계정에 한 번씩만 쓸 수 있어요.
@@ -104,6 +105,7 @@ export class Store extends DurableObject {
     this.sql.exec('UPDATE users SET fails = 0, locked = 0 WHERE id = ?', id);
     return { token: this.newSession(id), user: { id: u.id, name: u.name } };
   }
+  whoami(token) { return this.auth(token); }
   logout(token) { this.sql.exec('DELETE FROM sessions WHERE token = ?', String(token || '')); return { ok: true }; }
 
   load(token) {
@@ -126,6 +128,66 @@ export class Store extends DurableObject {
   }
 }
 
+// ───── 친선 배틀: 실시간 방 ─────
+// 접속한 사람 모두가 로비('')에 들어오고, 방('t-xxxxxx')에 들어가면 그 방 사람끼리만 메시지를 주고받습니다.
+// 게임 진행은 방장 화면이 맡고, 서버는 메시지를 전달하기만 합니다.
+const MAX_MSG = 128 * 1024, MAX_ROOMS = 4, MAX_PRESENCE = 400;
+export class Room extends DurableObject {
+  async fetch(request) {
+    if (request.headers.get('upgrade') !== 'websocket') return new Response('expected websocket', { status: 426 });
+    const uid = request.headers.get('x-uid'), name = request.headers.get('x-name') || uid;
+    const { 0: client, 1: server } = new WebSocketPair();
+    const peer = randHex(8);
+    this.ctx.acceptWebSocket(server);
+    server.serializeAttachment({ peer, uid, name, rooms: { '': null } });
+    server.send(JSON.stringify({ t: 'hello', peer }));
+    this.notify('');
+    return new Response(null, { status: 101, webSocket: client });
+  }
+  info(ws) { try { return ws.deserializeAttachment(); } catch (e) { return null; } }
+  members(room) { return this.ctx.getWebSockets().filter(w => { const a = this.info(w); return a && a.rooms && room in a.rooms; }); }
+  notify(room, left = []) {
+    const list = this.members(room);
+    const peers = list.map(w => { const a = this.info(w); return { peer: a.peer, by: a.uid, name: a.name, presence: a.rooms[room] ?? null, kind: 'viewer' }; });
+    const msg = JSON.stringify({ t: 'peers', room, peers, left });
+    for (const w of list) try { w.send(msg); } catch (e) {}
+  }
+  async webSocketMessage(ws, raw) {
+    if (typeof raw !== 'string' || raw.length > MAX_MSG) return;
+    let m; try { m = JSON.parse(raw); } catch (e) { return; }
+    const a = this.info(ws); if (!a || !m || typeof m !== 'object') return;
+    const room = typeof m.room === 'string' ? m.room.slice(0, 40) : '';
+    if (room && !/^[a-z0-9-]{1,40}$/.test(room)) return;
+    switch (m.t) {
+      case 'join':
+        if (!(room in a.rooms)) { if (Object.keys(a.rooms).length > MAX_ROOMS) return; a.rooms[room] = null; ws.serializeAttachment(a); }
+        this.notify(room); break;
+      case 'leave':
+        if (room && room in a.rooms) { delete a.rooms[room]; ws.serializeAttachment(a); this.notify(room, [{ peer: a.peer }]); }
+        break;
+      case 'presence': {
+        if (!(room in a.rooms)) return;
+        const d = m.data ?? null; if (JSON.stringify(d).length > MAX_PRESENCE) return;
+        a.rooms[room] = d; ws.serializeAttachment(a); this.notify(room); break;
+      }
+      case 'emit': {
+        if (!(room in a.rooms)) return;
+        const out = JSON.stringify({ t: 'msg', room, topic: String(m.topic || '').slice(0, 16), peer: a.peer, data: m.data ?? null });
+        for (const w of this.members(room)) if (w !== ws) try { w.send(out); } catch (e) {}
+        break;
+      }
+      case 'ping': try { ws.send('{"t":"pong"}'); } catch (e) {} break;
+    }
+  }
+  gone(ws) {
+    const a = this.info(ws); if (!a) return;
+    ws.serializeAttachment(null);
+    for (const room in a.rooms) this.notify(room, [{ peer: a.peer }]);
+  }
+  async webSocketClose(ws, code) { this.gone(ws); try { ws.close(code === 1005 ? 1000 : code, 'bye'); } catch (e) {} }
+  async webSocketError(ws) { this.gone(ws); }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -137,6 +199,14 @@ export default {
       const text = await request.text();
       if (text.length > MAX_SAVE) return json({ error: 'tooBig' }, 413);
       try { body = text ? JSON.parse(text) : {}; } catch (e) { return json({ error: 'badJson' }, 400); }
+    }
+    if (url.pathname === '/api/ws') {
+      if (request.headers.get('upgrade') !== 'websocket') return json({ error: 'expectedWebsocket' }, 426);
+      const u = await store.whoami(url.searchParams.get('token') || '');
+      if (!u) return new Response('auth', { status: 401 });
+      const h = new Headers(request.headers); h.set('x-uid', u.id); h.set('x-name', u.name);
+      const room = env.ROOM.get(env.ROOM.idFromName('friendly'));
+      return room.fetch(new Request(request, { headers: h }));
     }
     const route = request.method + ' ' + url.pathname;
     let r;
